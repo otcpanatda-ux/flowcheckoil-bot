@@ -1,185 +1,157 @@
-from flask import Flask, request, abort
 import os
+import re
+from flask import Flask, abort, request
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import ApiClient, Configuration, MessagingApi, ReplyMessageRequest, TextMessage
+from linebot.v3.webhooks import FileMessageContent, MessageEvent
 import pandas as pd
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, FileMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# ตั้งค่า Token และ Secret จาก LINE Developers
-LINE_CHANNEL_ACCESS_TOKEN = 'b3THdRpQxz9QmE1QzysGnt7U8ng6rsKMq+e56CEjP12XItIQcPJtkzavYeQ50ep6HQpIXc8up87wmHIxmyWOs99sP6P7MND8RP/H8ePNCmAYMuV70GIsjMfa0p2dR2Q6UFQOLqF4JKTa2hEwcf9biAdB04t89/1O/w1cDnyilFU='
-LINE_CHANNEL_SECRET = 'b431c328c07682a159b4c45314a61147'
+# ดึงค่า Configuration จาก Environment Variables ของ Render
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+  print(
+      "Warning: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET not set in"
+      " environment variables!"
+  )
 
-UPLOAD_FOLDER = './downloads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
 
-# ฐานข้อมูลจำลองในหน่วยความจำ สำหรับเก็บประวัติเลข ภส.1 (ในการใช้งานจริงสามารถเปลี่ยนเป็น Database เช่น SQLite)
-excise_database = {}
 
-@app.route("/callback", methods=['POST'])
+@app.route("/")
+def home():
+  return "FlowCheckOil Ass. is running successfully!"
+
+
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
+  signature = request.headers.get("X-Line-Signature", "")
+  body = request.get_data(as_text=True)
+  app.logger.info("Request body: " + body)
 
-@handler.add(MessageEvent, message=FileMessage)
+  try:
+    handler.handle(body, signature)
+  except InvalidSignatureError:
+    abort(400)
+  return "OK"
+
+
+@handler.add(MessageEvent, message=FileMessageContent)
 def handle_file_message(event):
+  with ApiClient(configuration) as api_client:
+    line_bot_api = MessagingApi(api_client)
     message_id = event.message.id
-    file_name = event.message.file_name
-    
-    # ตรวจสอบว่าเป็นไฟล์ Excel (.xls หรือ .xlsx) หรือไม่
-    if not (file_name.endswith('.xlsx') or file_name.endswith('.xls')):
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="❌ กรุณาส่งเฉพาะไฟล์ Excel (.xls หรือ .xlsx) สำหรับตรวจสอบข้อมูลใบขนและเลข ภส.1 เท่านั้นครับ")
-        )
-        return
 
-    # ดาวน์โหลดไฟล์เก็บไว้ในระบบ
-    message_content = line_bot_api.get_message_content(message_id)
-    file_path = os.path.join(UPLOAD_FOLDER, file_name)
-    with open(file_path, 'wb') as fd:
-        for chunk in message_content.iter_content():
-            fd.write(chunk)
+    # ดาวน์โหลดไฟล์ที่ผู้ใช้อส่งเข้ามาในแชท
+    from linebot.v3.messaging import MessagingApiBlob
 
-    # ประมวลผลและตรวจสอบไฟล์ Excel
-    result_message = process_excel_file(file_path, file_name)
-    
-    # ส่งข้อความสรุปผลกลับเข้าแชท LINE
+    blob_api = MessagingApiBlob(api_client)
+    message_content = blob_api.get_message_content(message_id)
+
+    original_filename = getattr(event.message, "file_name", "uploaded_file.xlsx")
+    local_path = f"/tmp/{message_id}_{original_filename}"
+
+    with open(local_path, "wb") as fd:
+      fd.write(message_content)
+
+    reply_text = process_excel_file(local_path, original_filename)
+
     line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=result_message)
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[TextMessage(text=reply_text)],
+        )
     )
 
-def process_excel_file(file_path, file_name):
-    try:
-        # อ่านไฟล์ดิบเพื่อค้นหาแถวหัวตารางอัตโนมัติ (Smart Parser รองรับฟอร์มที่หลากหลาย)
-        df_raw = pd.read_excel(file_path, sheet_name=0, header=None)
-    except Exception as e:
-        return f"❌ ไม่สามารถเปิดไฟล์ Excel ได้: {str(e)}"
 
-    header_row_index = -1
-    for idx, row in df_raw.iterrows():
-        row_str = " ".join([str(val) for val in row.values if pd.notna(val)])
-        if 'ภส' in row_str or 'จำนวน' in row_str or 'Transport' in row_str or 'Order No' in row_str:
-            header_row_index = idx
-            break
+def process_excel_file(file_path, filename):
+  try:
+    # โหลดไฟล์ Excel รองรับหลาย Sheet
+    xl = pd.ExcelFile(file_path)
+    extracted_data = []
 
-    if header_row_index == -1:
-        # หากหาแถวหัวตารางไม่เจอ ลองโหลดแบบปกติโดยใช้แถวที่ 0 หรือ 1 เป็นหลัก
-        header_row_index = 0
+    for sheet_name in xl.sheet_names:
+      df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
 
-    try:
-        df = pd.read_excel(file_path, sheet_name=0, header=header_row_index)
-    except Exception as e:
-        return f"❌ เกิดข้อผิดพลาดในการอ่านโครงสร้างตาราง: {str(e)}"
+      # ค้นหาแถวข้อมูลที่มีการขนส่งน้ำมันโดยสแกนหาคำว่า HSD หรือตัวเลขน้ำมัน
+      for r_idx, row in df.iterrows():
+        row_values = [str(val) for val in row.values if pd.notna(val)]
+        row_str = " ".join(row_values)
 
-    # แปลงชื่อคอลัมน์ให้เป็นมาตรฐานกลาง (Mapping)
-    column_mapping = {}
-    for col in df.columns:
-        col_str = str(col).strip()
-        if 'ภส' in col_str or 'กระดุมรถ' in col_str:
-            column_mapping[col] = 'Excise_No'
-        elif 'จำนวน' in col_str or 'ลิตร' in col_str or 'ความจุ' in col_str:
-            if 'ลิตร' in col_str or 'ความจุ' in col_str or 'จำนวน(ลิตร)' in col_str:
-                column_mapping[col] = 'Quantity'
-        elif 'ขนส่ง' in col_str or 'Transport' in col_str:
-            column_mapping[col] = 'Transporter'
-        elif 'ชนิด' in col_str or 'Product' in col_str:
-            column_mapping[col] = 'Product_Type'
+        # ตรวจสอบว่าในแถวมีคำว่า HSD หรือไม่
+        if "HSD" in row_str.upper() or "DIESEL" in row_str.upper():
+          # ค้นหาเลข ภส. (เลขตั๋วที่ขึ้นต้นด้วย 70...)
+          phs_number = "-"
+          volume = "-"
 
-    df = df.rename(columns=column_mapping)
+          for val in row.values:
+            val_str = str(val).strip()
+            # เลข ภส. / เลขตั๋ว มักจะขึ้นต้นด้วย 70 และมีความยาวประมาณ 10-14 หลัก
+            if re.match(r"^70\d{8,12}$", val_str):
+              phs_number = val_str
+            # ค้นหาปริมาณน้ำมันที่เป็นตัวเลขหลักหมื่นขึ้นไป (เช่น 40000, 42000)
+            elif pd.notna(val) and isinstance(val, (int, float)):
+              if val >= 1000 and val < 100000:
+                volume = f"{val:,.0f}"
+            elif val_str.isdigit() and int(val_str) >= 1000:
+              if int(val_str) < 100000:
+                volume = f"{val_str} ลิตร"
 
-    # ตรวจสอบคอลัมน์บังคับ
-    if 'Excise_No' not in df.columns or 'Quantity' not in df.columns:
-        return f"⚠️ ไฟล์ '{file_name}' มีรูปแบบที่ระบบยังไม่รองรับอัตโนมัติ (ไม่พบคอลัมน์เลข ภส. หรือ ปริมาณลิตรที่ชัดเจน)"
+          # พยายามหาทะเบียนรถหรือสถานที่ส่งในแถวเดียวกัน
+          truck_no = "-"
+          destination = "-"
+          for val in row.values:
+            val_str = str(val).strip()
+            if "-" in val_str and len(val_str) <= 12 and any(char.isdigit() for char in val_str):
+              if truck_no == "-":
+                truck_no = val_str
 
-    report_lines = [f"📁 **รายงานผลการตรวจสอบไฟล์:**\n`{file_name}`\n" + "—" * 24]
-    valid_count = 0
+          extracted_data.append(
+              f"✅ อ่านไฟล์ '{filename}' สำเร็จ\n"
+              f"• เลข ภส. (ตั๋ว): {phs_number}\n"
+              f"• ปริมาณ: {volume}\n"
+              f"• ทะเบียนรถ: {truck_no}"
+          )
+          break
 
-    for index, row in df.iterrows():
-        excise_raw = row.get('Excise_No')
-        if pd.isna(excise_raw):
-            continue
-            
-        excise_no = str(excise_raw).strip()
-        # ข้ามแถวที่เป็นค่าว่างหรือแถวสรุปยอดรวม
-        if not excise_no or excise_no.lower() == 'nan' or 'total' in excise_no.lower() or 'รวม' in excise_no:
-            continue
+    if extracted_data:
+      return "\n\n".join(extracted_data)
+    else:
+      return (
+          f"⚠️ อ่านไฟล์ '{filename}' สำเร็จ แต่ไม่พบรายการข้อมูลเลข ภส.1"
+          " หรือปริมาณน้ำมันในแถวข้อมูล กรุณาตรวจสอบรูปแบบไฟล์อีกครั้งครับ"
+      )
 
-        # ดึงข้อมูลอื่น ๆ (ถ้ามี)
-        qty_val = row.get('Quantity', 0)
-        try:
-            new_qty = float(str(qty_val).replace(',', ''))
-        except ValueError:
-            new_qty = 0.0
+  except Exception as e:
+    return (
+        f"❌ เกิดข้อผิดพลาดในการประมวลผลไฟล์ '{filename}': {str(e)}"
+    )
 
-        if new_qty <= 0:
-            continue
 
-        transporter = str(row.get('Transporter', 'ไม่ระบุ')).strip()
-        if transporter == 'nan':
-            transporter = 'ไม่ระบุ'
-            
-        product = str(row.get('Product_Type', 'HSD/น้ำมัน')).strip()
-        if product == 'nan':
-            product = 'HSD'
-
-        valid_count += 1
-        status_text = ""
-
-        # ตรวจสอบประวัติการส่งไฟล์ซ้ำ (Version Control / Reconciliation)
-        if excise_no in excise_database:
-            old_data = excise_database[excise_no]
-            old_qty = old_data['Quantity']
-            diff = new_qty - old_qty
-
-            if diff != 0:
-                change_type = "เพิ่มขึ้น 📈" if diff > 0 else "ลดลง 📉"
-                status_text = (
-                    f"\n   ⚠️ **[พบเลข ภส.1 ซ้ำในระบบ]**\n"
-                    f"   🔄 *มีการแก้ไขปริมาณ:*\n"
-                    f"   • ยอดเดิม: {old_qty:,.2f} ลิตร\n"
-                    f"   • ยอดใหม่: {new_qty:,.2f} ลิตร\n"
-                    f"   • **เปลี่ยนแปลง:** {change_type} {abs(diff):,.2f} ลิตร"
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+  with ApiClient(configuration) as api_client:
+    line_bot_api = MessagingApi(api_client)
+    line_bot_api.reply_message(
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[
+                TextMessage(
+                    text=(
+                        "สวัสดีครับ! ส่งไฟล์ Excel รายงานการขนส่งน้ำมันเข้ามาได้เลยครับ"
+                        " เดี๋ยวผมช่วยตรวจสอบข้อมูลและเลข ภส. ให้ครับ 🛢️"
+                    )
                 )
-            else:
-                status_text = "\n   📌 *[ข้อมูลเลข ภส.1 ซ้ำ แต่ปริมาณคงเดิม]*"
-        else:
-            status_text = "\n   ✨ *[บันทึกข้อมูลใหม่ครั้งแรก]*"
-
-        # บันทึกสถานะล่าสุดลงฐานข้อมูล
-        excise_database[excise_no] = {
-            'Quantity': new_qty,
-            'Product': product,
-            'Transporter': transporter,
-            'File': file_name
-        }
-
-        item_summary = (
-            f"\n🔹 **เลข ภส.1:** `{excise_no}`\n"
-            f"   - สินค้า: {product}\n"
-            f"   - ปริมาณ: **{new_qty:,.2f} ลิตร**\n"
-            f"   - ขนส่งโดย: {transporter}\n"
-            f"   - สถานะ: {status_text}\n"
+            ],
         )
-        report_lines.append(item_summary)
+    )
 
-    if valid_count == 0:
-        return f"⚠️ อ่านไฟล์ '{file_name}' สำเร็จ แต่ไม่พบรายการข้อมูลตัวเลข ภส.1 หรือปริมาณน้ำมันในแถวข้อมูล กรุณาตรวจสอบรูปแบบไฟล์อีกครั้งครับ"
-
-    report_lines.append("—" * 24)
-    report_lines.append(f"✅ ประมวลผลสำเร็จ {valid_count} รายการ | พร้อมตรวจสอบความถูกต้องครับ")
-
-    return "\n".join(report_lines)
 
 if __name__ == "__main__":
-    app.run(port=5000)
+  port = int(os.environ.get("PORT", 5000))
+  app.run(host="0.0.0.0", port=port)
