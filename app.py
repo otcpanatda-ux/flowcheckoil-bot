@@ -9,7 +9,6 @@ import pandas as pd
 
 app = Flask(__name__)
 
-# ดึงค่า Configuration จาก Environment Variables ของ Render
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
@@ -47,7 +46,6 @@ def handle_file_message(event):
     line_bot_api = MessagingApi(api_client)
     message_id = event.message.id
 
-    # ดาวน์โหลดไฟล์ที่ผู้ใช้อส่งเข้ามาในแชท
     from linebot.v3.messaging import MessagingApiBlob
 
     blob_api = MessagingApiBlob(api_client)
@@ -71,56 +69,65 @@ def handle_file_message(event):
 
 def process_excel_file(file_path, filename):
   try:
-    # โหลดไฟล์ Excel รองรับหลาย Sheet
     xl = pd.ExcelFile(file_path)
-    extracted_data = []
+    all_records = []
 
     for sheet_name in xl.sheet_names:
       df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
 
-      # ค้นหาแถวข้อมูลที่มีการขนส่งน้ำมันโดยสแกนหาคำว่า HSD หรือตัวเลขน้ำมัน
       for r_idx, row in df.iterrows():
-        row_values = [str(val) for val in row.values if pd.notna(val)]
+        row_values = [str(val).strip() for val in row.values if pd.notna(val)]
         row_str = " ".join(row_values)
 
-        # ตรวจสอบว่าในแถวมีคำว่า HSD หรือไม่
+        # ตรวจสอบแถวที่เป็นรายการขนส่งน้ำมัน (มี HSD หรือ DIESEL)
         if "HSD" in row_str.upper() or "DIESEL" in row_str.upper():
-          # ค้นหาเลข ภส. (เลขตั๋วที่ขึ้นต้นด้วย 70...)
           phs_number = "-"
           volume = "-"
+          truck_no = "-"
+          driver_name = "-"
+          phone_no = "-"
 
+          # ค้นหาข้อมูลเชิงลึกในแถว
           for val in row.values:
             val_str = str(val).strip()
-            # เลข ภส. / เลขตั๋ว มักจะขึ้นต้นด้วย 70 และมีความยาวประมาณ 10-14 หลัก
+            # 1. เลข ภส. (ขึ้นต้นด้วย 70 และมีความยาว 10-14 หลัก)
             if re.match(r"^70\d{8,12}$", val_str):
               phs_number = val_str
-            # ค้นหาปริมาณน้ำมันที่เป็นตัวเลขหลักหมื่นขึ้นไป (เช่น 40000, 42000)
+            # 2. ปริมาณน้ำมัน (ตัวเลขหลักหมื่น เช่น 40000, 42000, 43000)
             elif pd.notna(val) and isinstance(val, (int, float)):
-              if val >= 1000 and val < 100000:
-                volume = f"{val:,.0f}"
-            elif val_str.isdigit() and int(val_str) >= 1000:
-              if int(val_str) < 100000:
-                volume = f"{val_str} ลิตร"
-
-          # พยายามหาทะเบียนรถหรือสถานที่ส่งในแถวเดียวกัน
-          truck_no = "-"
-          destination = "-"
-          for val in row.values:
-            val_str = str(val).strip()
-            if "-" in val_str and len(val_str) <= 12 and any(char.isdigit() for char in val_str):
+              if 1000 <= val < 100000:
+                volume = f"{val:,.0f} ลิตร"
+            elif val_str.isdigit() and 1000 <= int(val_str) < 100000:
+              volume = f"{val_str} ลิตร"
+            # 3. เบอร์โทรศัพท์ (รูปแบบ 0xx-xxx-xxxx หรือ 0xxxxxxxx)
+            elif re.match(r"^0\d{1,2}[-\s]?\d{3}[-\s]?\d{4}$", val_str):
+              phone_no = val_str
+            # 4. ทะเบียนรถ (มีขีดและตัวเลขผสม เช่น 70-4329 หรือ กท.700)
+            elif "-" in val_str and any(char.isdigit() for char in val_str) and len(val_str) <= 18:
               if truck_no == "-":
                 truck_no = val_str
+              else:
+                truck_no += f" / {val_str}"
 
-          extracted_data.append(
-              f"✅ อ่านไฟล์ '{filename}' สำเร็จ\n"
+          # ค้นหาชื่อคนขับ (มักจะเป็นข้อความที่มีตัวอักษรไทยยาว 2-4 คำติดกันในแถว)
+          for val in row.values:
+            val_str = str(val).strip()
+            if re.match(r"^[ก-ฮ\s]{4,30}$", val_str) and "HSD" not in val_str and "ระนอง" not in val_str:
+              if driver_name == "-":
+                driver_name = val_str
+
+          all_records.append(
+              f"🚚 รายการที่ {len(all_records)+1}\n"
               f"• เลข ภส. (ตั๋ว): {phs_number}\n"
               f"• ปริมาณ: {volume}\n"
-              f"• ทะเบียนรถ: {truck_no}"
+              f"• ทะเบียนรถ: {truck_no}\n"
+              f"• พนักงานขับรถ: {driver_name}\n"
+              f"• เบอร์โทร: {phone_no}"
           )
-          break
 
-    if extracted_data:
-      return "\n\n".join(extracted_data)
+    if all_records:
+      header_msg = f"✅ อ่านไฟล์ '{filename}' สำเร็จ (พบ {len(all_records)} รายการ):\n\n"
+      return header_msg + "\n\n".join(all_records)
     else:
       return (
           f"⚠️ อ่านไฟล์ '{filename}' สำเร็จ แต่ไม่พบรายการข้อมูลเลข ภส.1"
@@ -128,9 +135,7 @@ def process_excel_file(file_path, filename):
       )
 
   except Exception as e:
-    return (
-        f"❌ เกิดข้อผิดพลาดในการประมวลผลไฟล์ '{filename}': {str(e)}"
-    )
+    return f"❌ เกิดข้อผิดพลาดในการประมวลผลไฟล์ '{filename}': {str(e)}"
 
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -144,7 +149,7 @@ def handle_text_message(event):
                 TextMessage(
                     text=(
                         "สวัสดีครับ! ส่งไฟล์ Excel รายงานการขนส่งน้ำมันเข้ามาได้เลยครับ"
-                        " เดี๋ยวผมช่วยตรวจสอบข้อมูลและเลข ภส. ให้ครับ 🛢️"
+                        " เดี๋ยวผมช่วยตรวจเช็คข้อมูลทุกคันให้ครับ 🛢️"
                     )
                 )
             ],
